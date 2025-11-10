@@ -1,145 +1,135 @@
 package Master;
 
-import java.io.IOException;
-import java.io.PrintWriter;
+import java.io.*;
 import java.net.Socket;
-import java.util.List;
-import java.util.Map;
-import java.util.Scanner;
 
+//Gestisce la comunicazione tra un singolo peer e il master
+//Ogni connessione con un peer viene servita da un thread dedicato (istanza di ClientHandler)
+//cosi il master può gestire più peer contemporaneamente
 public class ClientHandler implements Runnable {
-    private final Socket socket;
-    private final ResourceService resourceService;
-    private final int clientId;
+    private final Socket clientSocket;  //rappresenta la connessione attiva tra master e peer
+    private final ResourceService resourceService;//riferimento all'oggetto che gestisce le risorse
+    private final boolean running = true; //flag per verificare eventuali errori di connessione
 
-    public ClientHandler(Socket socket, ResourceService resourceService, int clientId) {
-        this.socket = socket;
+    //Costruttore
+    public ClientHandler(Socket clientSocket, ResourceService resourceService) {
+        this.clientSocket = clientSocket;
         this.resourceService = resourceService;
-        this.clientId = clientId;
     }
 
     @Override
     public void run() {
-        try (Scanner from = new Scanner(socket.getInputStream());
-             PrintWriter to = new PrintWriter(socket.getOutputStream(), true)) {
+        try (//si usa try per assicurarsi che in e out si chiudano automaticamente
+             //crea due stream di comunicazione:
+             //in serve per leggere ciò che il Peer invia al master
+             //out serve per inviare risposte dal master al Peer
+                BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
+                PrintWriter out = new PrintWriter(clientSocket.getOutputStream(), true)
+        ) {
+            String line; // variabile per memorizzare temporaneamente ogni comando ricevuto
+            // ciclo principale del thread: rimane in esecuzione finché il peer è connesso
+            while ((line = in.readLine()) != null) {
+                // divide la stringa ricevuta in token separati da spazi
+                String[] parts = line.split("\\s+");
+                //se la riga è vuota o malformata, passa oltre
+                if (parts.length == 0) continue;
 
-            while (!Thread.interrupted() && !socket.isClosed()) {
-                if (!from.hasNextLine()) break;
+                // --- DOWNLOAD_RESULT ---
+                // gestisce il messaggio di conferma del completamento di un download
+                if (parts[0].equalsIgnoreCase("DOWNLOAD_RESULT")) {
+                    // il comando deve contenere almeno 5 parametri
+                    if (parts.length >= 5) {
+                        String resource = parts[1]; // estrae il nome della risorsa
+                        String sourcePeer = parts[2]; // estrae il Peer sorgente
+                        String targetPeer = parts[3]; // estrae il Peer richiedente
+                        String stato = parts[4]; // esito del download
+                        // aggiorna il registro dei download nel ResourceService
+                        resourceService.updateDownloadResult(resource, sourcePeer, targetPeer, stato);
+                    }
+                    continue;
+                }
 
-                String request = from.nextLine().trim();
-                if (request.isEmpty()) continue;
+                // --- ADD ---
+                // un Peer comunica al master di aggiungere (o registrare) una risorsa
+                if (parts.length >= 3 && parts[0].equalsIgnoreCase("add")) {
+                    String resourceName = parts[1]; // nome della risorsa
+                    String peerName = parts[2]; // nome del Peer
+                    // aggiorna la tabella delle risorse
+                    resourceService.addResource(resourceName, peerName, out);
 
-                String[] parts = request.split("\\s+");
-                String cmd = parts[0].toLowerCase();
+                    // --- DOWNLOAD ---
+                    // Un peer chiede di scaricare una risorsa
+                } else if (parts.length >= 3 && parts[0].equalsIgnoreCase("download")) {
+                    String resourceName = parts[1]; // nome della risorsa
+                    String peerName = parts[2]; // nome del peer richiedente
+                    // delega la logica di gestione al resourceService
+                    resourceService.handleDownload(resourceName, peerName, out);
 
-                switch (cmd) {
+                    // --- LISTDATA ---
+                    //Il peer chiede l'elenco di tutte le risorse note al master
+                } else if (parts[0].equalsIgnoreCase("listdata")) {
+                    // per ogni risorsa nella tabella, stampa i peer associati
+                    resourceService.getAllResources().forEach((res, peers) ->
+                            out.println(res + ": " + String.join(", ", peers))
+                    );
+                    out.println("END");
 
-                    case "hello":
-                        // Nuovo comando per registrare peer con IP e porta
-                        if (parts.length >= 3) {
-                            String peerName = parts[1];
-                            int peerPort;
-                            try {
-                                peerPort = Integer.parseInt(parts[2]);
-                            } catch (NumberFormatException e) {
-                                to.println("ERRORE: porta non valida");
-                                to.println("END");
-                                break;
-                            }
-                            String peerIp = socket.getInetAddress().getHostAddress();
-                            resourceService.registerPeer(peerName, peerIp, peerPort);
-                            to.println("REGISTERED " + peerName);
-                        } else {
-                            to.println("ERRORE: uso corretto -> hello <peerName> <peerPort>");
-                        }
-                        to.println("END");
-                        break;
-                    case "updatefail":
-                        if (parts.length >= 3) {
-                            String fileName = parts[1];
-                            String peerName = parts[2];
-                            System.out.println("Il peer " + peerName + " non ha fornito il file " + fileName);
+                    // --- QUIT ---
+                    // il Peer comunica la disconnessione volontaria
+                } else if (parts[0].equalsIgnoreCase("quit")) {
+                    break; // esce dal ciclo e termina il thread
 
-                            //Aggiorna la tabella delle risorse rimuovendo l'associazione errata
-                            resourceService.unregisterResource(fileName, peerName);
+                    // --- CHECK ---
+                    // controlla se un peer è associato a una determinata risorsa
+                } else if (parts.length >= 3 && parts[0].equalsIgnoreCase("check")) {
+                    String resourceName = parts[1];
+                    String peerName = parts[2];
+                    // verifica tramite resourceService
+                    boolean associated = resourceService.isAssociated(resourceName, peerName);
+                    // invio il risultato al peer
+                    out.println(associated ? "ASSOCIATED" : "NOT_ASSOCIATED");
+                    out.println("END");
 
-                            System.out.println("Tabella aggiornata: rimossa associazione " + peerName + " → " + fileName);
-                            to.println("OK: Risorsa rimossa dal peer " + peerName);
-                        } else {
-                            to.println("ERRORE: uso corretto -> updatefail <file> <peer>");
-                        }
-                        to.println("END");
-                        break;
+                    // --- HELLO ---
+                    // primo messaggio inviato dal peer al momento della connessione: serve per registrarsi
+                } else if (parts[0].equalsIgnoreCase("hello") && parts.length >= 3) {
+                    String peerName = parts[1]; //nome del peer
+                    int peerPort = Integer.parseInt(parts[2]); //porta sulla quale ascolta
+                    String peerIP = clientSocket.getInetAddress().getHostAddress(); //IP
+                    //registra il peer nel resourceService
+                    resourceService.registerPeer(peerName, peerIP, peerPort);
+                    //invia conferma al peer
+                    out.println("REGISTERED " + peerName);
+                    out.println("END");
 
-                    case "listdata":
-                        Map<String, List<String>> resources = resourceService.getAllResources();
-                        if (resources == null || resources.isEmpty()) {
-                            to.println("Nessuna risorsa disponibile nei peer.");
-                        } else {
-                            for (Map.Entry<String, List<String>> e : resources.entrySet()) {
-                                to.println(e.getKey() + ": " + String.join(", ", e.getValue()));
-                            }
-                        }
-                        to.println("END");
-                        break;
+                    // --- UPDATEFAIL ---
+                    // segnala che un download è fallito per colpa di un peer non disponibile
+                } else if (parts[0].equalsIgnoreCase("updatefail") && parts.length >= 3) {
+                    String fileName = parts[1]; //risorsa
+                    String peerName = parts[2]; //nome peer
+                    // rimuove l'associazione tra peer e risorsa
+                    resourceService.unregisterResource(fileName, peerName);
+                    // invia conferma
+                    out.println("OK: Risorsa rimossa dal peer " + peerName);
+                    out.println("END");
 
-                    case "check":
-                        if (parts.length >= 3) {
-                            String res = parts[1];
-                            String peer = parts[2];
-                            boolean associated = resourceService.isAssociated(res, peer);
-                            to.println(associated ? "ASSOCIATED" : "NOT_ASSOCIATED");
-                        } else {
-                            to.println("ERRORE: uso corretto -> check <risorsa> <peer>");
-                        }
-                        to.println("END");
-                        break;
-
-                    case "add":
-                        if (parts.length >= 3) {
-                            String res = parts[1];
-                            String peer = parts[2];
-                            resourceService.addResource(res, peer, to);
-                        } else {
-                            to.println("ERRORE: uso corretto -> add <risorsa> <peer>");
-                        }
-                        to.println("END");
-                        break;
-
-                    case "download":
-                        if (parts.length >= 3) {
-                            // Ora handleDownload restituisce PEER <nome> <ip> <porta>
-                            resourceService.handleDownload(parts[1], parts[2], to);
-                        } else {
-                            to.println("ERRORE: uso corretto -> download <risorsa> <peer>");
-                            to.println("END");
-                        }
-                        break;
-
-                    case "quit":
-                        to.println("Connessione chiusa.");
-                        to.println("END");
-                        socket.close();
-                        return;
-
-                    default:
-                        to.println("Comando non riconosciuto: " + cmd);
-                        to.println("END");
+                    // --- UNKNOWN COMMAND ---
+                    // caso di comando non riconosciuto
+                } else {
+                    out.println("Comando sconosciuto.");
+                    out.println("END");
                 }
             }
-
-        } catch (IOException e) {
-            // Connessione interrotta: ignora
-        } finally {
-            closeConnection();
+        } // se la connessione si interrompe in modo imprevisto
+        catch (IOException e) {
+            if (running) {
+                e.printStackTrace(); // stampa solo se non è stata una chiusura controllata
+            }
+        } // blocco finale eseguito sempre, anche in caso di errore
+        finally {
+            try { // chiude il socket se ancora aperto
+                clientSocket.close();
+            } catch (IOException ignored) {}
         }
     }
-
-    public void closeConnection() {
-        try {
-            if (socket != null && !socket.isClosed()) socket.close();
-        } catch (IOException ignored) {}
-    }
-
-
 }

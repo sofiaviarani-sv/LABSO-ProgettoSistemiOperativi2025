@@ -5,100 +5,71 @@ import java.net.*;
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * Gestisce le connessioni dai peer.
- */
+//Accetta le connessioni dai peer tramite ServerSocket
+//Crea un thread dedicato per ogni peer per gestire le richieste in modo concorrente
+//Smista i comandi del peer a ResourceService, che mantiene lo stato delle risorse e dei peer associati
+
 public class SocketListener implements Runnable {
+    //socket del master che ascolta le connessioni in entrata
     private final ServerSocket serverSocket;
+    //riferimento alla classe ResourceService
     private final ResourceService resourceService;
+    //lista dei socket attivi, usata per chiuderli tutti in caso di quit
     private final List<Socket> clients = new ArrayList<>();
+    //booleano per controllare se il listener deve continuare ad accettare connesioni
     private boolean running = true;
 
+    //Costruttore
     public SocketListener(ServerSocket serverSocket, ResourceService resourceService) {
         this.serverSocket = serverSocket;
         this.resourceService = resourceService;
     }
-
     @Override
+    //metodo eseguito su un thread separato: gestisce in modo continuo le nuove connessioni in arrivo dai peer
     public void run() {
+        //Continua ad accettare peer finchè il master non chiude il server
         while (running) {
             try {
+                //Blocca l'esecuzione fino a quando un peer non prova a connettersi al master
+                //A quel punto, accept() crea un nuovo oggetto Socket che rappresenta quella specifica connessione
                 Socket clientSocket = serverSocket.accept();
+                //Solo un thread alla volta può modificare la lista clients
                 synchronized (clients) {
+                    //Aggiunge il nuovo socket del peer alla lista dei socket attivi
                     clients.add(clientSocket);
                 }
-                new Thread(() -> handleClient(clientSocket)).start();
+                //Crea un nuovo oggetto ClientHandler per gestire la comunicazione con il peer appena connesso
+                //gli passa il socket del peer (clientSocket) e il riferimento a resourceService
+                //che contiene lo stato condiviso (peer registrati e risorse disponibili)
+                ClientHandler handler = new ClientHandler(clientSocket, resourceService);
+                //crea un nuovo thread che eseguirà in parallelo il codice del ClientHandler
+                //questo consente al master di gestire più peer contemporaneamente, senza bloccare
+                //l'accettazione di nuove connessioni
+                Thread clientThread = new Thread(handler);
+                //avvia il thread del ClientHandler, che comincerà a leggere i comandi del peer e a rispondergli.
+                //Dopo questa chiamata, il Master torna immediatamente in attesa di nuovi peer su accept()
+                clientThread.start();
+
             } catch (IOException e) {
-                if (running) { // solo se non stiamo chiudendo intenzionalmente
-                    e.printStackTrace();
+                if (running) {//Se running è true, significa che non stiamo chiudendo il server intenzionalmente
+                    e.printStackTrace();//stampiamo per capire l'errore
                 }
-                // se stiamo chiudendo, ignora
+                //Se running è false, significa che il master sta chiudendo volontariamente, quindi possiamo ignorare l'eccezione
             }
         }
     }
 
-    private void handleClient(Socket clientSocket) {
-        try (
-                BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
-                PrintWriter out = new PrintWriter(clientSocket.getOutputStream(), true)
-        ) {
-            String line;
-            while ((line = in.readLine()) != null) {
-                String[] parts = line.split("\\s+");
-                if (parts.length >= 3 && parts[0].equalsIgnoreCase("add")) {
-                    String resourceName = parts[1];
-                    String peerName = parts[2];
-                    resourceService.addResource(resourceName, peerName, out); // <-- usa il PrintWriter locale
-                } else if (parts.length >= 2 && parts[0].equalsIgnoreCase("download")) {
-                    String resourceName = parts[1];
-                    String peerName = parts[2];
-                    resourceService.handleDownload(resourceName, peerName, out);
-                } else if (parts[0].equalsIgnoreCase("listdata")) {
-                    resourceService.getAllResources().forEach((res, peers) ->
-                            out.println(res + ": " + String.join(", ", peers))
-                    );
-                    out.println("END");
-                } else if (parts[0].equalsIgnoreCase("quit")) {
-                    break;
-                } else if (parts.length >= 3 && parts[0].equalsIgnoreCase("check")) {
-                    String resourceName = parts[1];
-                    String peerName = parts[2];
-                    boolean associated = resourceService.isAssociated(resourceName, peerName);
-                    out.println(associated ? "ASSOCIATED" : "NOT_ASSOCIATED");
-                    out.println("END");
-                } else if (parts[0].equalsIgnoreCase("hello") && parts.length >= 3) {
-                    String peerName = parts[1];
-                    int peerPort = Integer.parseInt(parts[2]);
-                    String peerIP = clientSocket.getInetAddress().getHostAddress();
-                    resourceService.registerPeer(peerName, peerIP, peerPort);
-                    out.println("REGISTERED " + peerName);
-                    out.println("END");
-                } else {
-                    out.println("Comando sconosciuto");
-                    out.println("END");
-                }
-            }
-        } catch (IOException e) {
-            if (running) {
-                e.printStackTrace();
-            }
-        } finally {
-            try {
-                clientSocket.close();
-            } catch (IOException ignored) {
-            }
-        }
-    }
-
-
+    //Metodo per spegnere tutti i socket attivi
     public void closeAllClients() {
-        running = false;
+        running = false; //socketListener non deve accettare più connessioni
+        //modifica la lista dei socket attivi
         synchronized (clients) {
             for (Socket s : clients) {
+                //cicla e chiude tutti i socket uno per uno
                 try { s.close(); } catch (IOException ignored) {}
             }
         }
-        try {
+        try {//chiude il serverSocket del master, così che non accetti più connessioni
             serverSocket.close();
         } catch (IOException ignored) {}
     }
